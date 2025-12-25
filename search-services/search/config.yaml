@@ -1,0 +1,4 @@
+address: :8080
+db_address: postgres://postgres:password@postgres:5432/postgres
+words_address: words:8080
+log_level: DEBUG

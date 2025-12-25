@@ -1,0 +1,115 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+
+	"yadro.com/course/api/adapters/auth"
+	"yadro.com/course/api/adapters/rest"
+	"yadro.com/course/api/adapters/search"
+	"yadro.com/course/api/adapters/update"
+	"yadro.com/course/api/adapters/words"
+	"yadro.com/course/api/config"
+	"yadro.com/course/api/core"
+)
+
+func main() {
+	var configPath string
+	flag.StringVar(&configPath, "config", "config.yaml", "server configuration file")
+	flag.Parse()
+
+	cfg := config.MustLoad(configPath)
+
+	log := mustMakeLogger(cfg.LogLevel)
+
+	log.Info("starting server")
+
+	updateClient, err := update.NewClient(cfg.UpdateAddress, log)
+	if err != nil {
+		log.Error("cannot init update adapter", "error", err)
+		os.Exit(1)
+	}
+
+	wordsClient, err := words.NewClient(cfg.WordsAddress, log)
+	if err != nil {
+		log.Error("cannot init words adapter", "error", err)
+		os.Exit(1)
+	}
+
+	searchClient, err := search.NewClient(cfg.SearchAddress, log)
+	if err != nil {
+		log.Error("cannot init search adapter", "error", err)
+		os.Exit(1)
+	}
+
+	authAdapter := auth.New(cfg.AdminUser, cfg.AdminPassword, cfg.TokenTTL)
+
+	mw := rest.NewMiddleware(log, authAdapter)
+
+	pingers := map[string]core.Pinger{
+		"update": updateClient,
+		"words":  wordsClient,
+		"search": searchClient,
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("GET /api/ping", rest.NewPingHandler(log, pingers))
+
+	mux.Handle("POST /api/db/update", mw.AuthMiddleware(rest.NewUpdateHandler(log, updateClient)))
+	mux.Handle("DELETE /api/db", mw.AuthMiddleware(rest.NewDropHandler(log, updateClient)))
+
+	mux.Handle("GET /api/search", mw.ConcurrencyLimitMiddleware(cfg.SearchConcurrency, rest.NewSearchHandler(log, searchClient)))
+
+	mux.Handle("GET /api/isearch", mw.RateLimitMiddleware(cfg.SearchRate, rest.NewISearchHandler(log, searchClient)))
+
+	mux.Handle("POST /api/login", rest.NewLoginHandler(log, authAdapter))
+
+	mux.Handle("GET /api/db/stats", rest.NewUpdateStatsHandler(log, updateClient))
+	mux.Handle("GET /api/db/status", rest.NewUpdateStatusHandler(log, updateClient))
+
+	server := http.Server{
+		Addr:        cfg.HTTPConfig.Address,
+		ReadTimeout: cfg.HTTPConfig.Timeout,
+		Handler:     mux,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	go func() {
+		<-ctx.Done()
+		log.Debug("shutting down server")
+		if err := server.Shutdown(context.Background()); err != nil {
+			log.Error("erroneous shutdown", "error", err)
+		}
+	}()
+
+	log.Info("Running HTTP server", "address", cfg.HTTPConfig.Address)
+	if err := server.ListenAndServe(); err != nil {
+		if !errors.Is(err, http.ErrServerClosed) {
+			log.Error("server closed unexpectedly", "error", err)
+			return
+		}
+	}
+}
+
+func mustMakeLogger(logLevel string) *slog.Logger {
+	var level slog.Level
+	switch logLevel {
+	case "DEBUG":
+		level = slog.LevelDebug
+	case "INFO":
+		level = slog.LevelInfo
+	case "ERROR":
+		level = slog.LevelError
+	default:
+		panic("unknown log level: " + logLevel)
+	}
+	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
+	return slog.New(handler)
+}
